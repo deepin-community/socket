@@ -1,0 +1,1061 @@
+--- socket-1.1.orig/BLURB
++++ socket-1.1/BLURB
+@@ -1,6 +1,6 @@
+ This is release 1.1 of the Socket(1) program.
+ 
+-Socket(1) implements an interface to TCP sockets at shell level.
++Socket(1) implements an interface to TCP and UNIX sockets at shell level.
+ Client and server sockets can be used from shell scripts or
+ interactively.  Socket can also run a program with stdin, stdout, and
+ stderr connected to the socket connection.  Sample shell scripts
+--- socket-1.1.orig/CHANGES
++++ socket-1.1/CHANGES
+@@ -17,3 +17,5 @@ User-visible changes in Socket version 1
+     message
+ 
+   - slightly more adequate signal handling and messages
++
++  - support of UNIX domain sockets
+--- socket-1.1.orig/Makefile
++++ socket-1.1/Makefile
+@@ -8,13 +8,13 @@
+ ### socket.1 in /usr/local/man/man1/socket.1
+ ### Make sure the target directories exist before doing a "make install".
+ 
+-INSTALLBASE = /usr/local
++INSTALLBASE = $(DESTDIR)/usr
+ INSTALLBINPATH = $(INSTALLBASE)/bin
+ INSTALLBINMODE = 755
+ INSTALLMANPATH = $(INSTALLBASE)/man
+-INSTALLMANMODE = 444
++INSTALLMANMODE = 644
+ CC = cc
+-CFLAGS  = $(SWITCHES) -O
++CFLAGS  = $(SWITCHES) -O2
+ LDFLAGS = $(SWITCHES) -s
+ 
+ ### You may need to uncomment some lines below for your operating
+@@ -78,7 +78,7 @@ tags: TAGS
+ TAGS: $(PROGSOURCES) $(HEADERS)
+ 	etags $(PROGSOURCES) $(HEADERS)
+ 
+-installtargets: $(INSTALLBINPATH)/$(TARGET) installmanuals
++installtargets: $(INSTALLBINPATH)/$(TARGET)
+ 
+ $(INSTALLBINPATH)/$(TARGET): $(TARGET)
+ 	@-echo "installing $(TARGET) in $(INSTALLBINPATH)"; \
+--- socket-1.1.orig/README
++++ socket-1.1/README
+@@ -9,7 +9,7 @@ this program is licensed to you.
+ 
+ What is it?
+ 
+-The program Socket implements access to TCP sockets from shell level.
++The program Socket implements access to TCP or UNIX sockets from shell level.
+ First written for the need to open a server socket and read and write
+ to the socket interactively for testing purposes, it quickly evolved
+ into a generic tool providing the socket interface for shell script
+@@ -19,7 +19,8 @@ and interactive use.
+ Client mode
+ 
+ In client mode (which is the default) it connects to a given port at a
+-given host.  Data read from the socket is written to stdout, data read
++given host or to a given UNIX domain socket specified by a pathname on the
++local filesystem(s). Data read from the socket is written to stdout, data read
+ from stdin is written to the socket.  When the peer closes the
+ connection or a signal is received, the program terminates.  An
+ example for this is the following command:
+@@ -35,7 +36,8 @@ server, any output from the server is wr
+ Server mode
+ 
+ In server mode (indicated by the "-s" command line switch) it binds a
+-server socket to the given port on the local host and accepts a
++server socket to the given port on the local host (INET sockets)
++or a given pathname on the local filesystem (UNIX sockets) and accepts a
+ connection.  When a client connects to this socket, all data read from
+ the socket is written to stdout, data read from stdin is written to
+ the socket.  For example, the command
+--- socket-1.1.orig/globals.h
++++ socket-1.1/globals.h
+@@ -8,6 +8,7 @@ Please read the file COPYRIGHT for furth
+ */
+ 
+ #include "patchlevel.h"
++#include <errno.h>
+ 
+ /* globals for socket */
+ 
+@@ -22,22 +23,28 @@ Please read the file COPYRIGHT for furth
+ #define A(args) ()
+ #endif
+ 
+-int create_server_socket A((int port, int queue_length)) ;
+-int create_client_socket A((char **hostname, int port)) ;
++int create_server_socket_inet A((long int local_ip, int port, int queue_length)) ;
++int create_server_socket_unix A((char *pathname,int queue_length)) ;
++int create_client_socket_inet A((long int local_ip, char **hostname, int port)) ;
++int create_client_socket_unix A((char *pathname)) ;
+ int resolve_service A((char *name_or_number, char *protocol, char **name)) ;
+ void catchsig A((int sig)) ;
+ void usage A((void)) ;
+ int do_read_write A((int from, int to)) ;
+ int do_write A((char *buffer, int size, int to)) ;
++void do_io A((void)) ;
+ char *so_release A((void)) ;
+ void open_pipes A((char *prog)) ;
+ void wait_for_children A((void)) ;
+ void perror2 A((char *s)) ;
++int is_number A((char *s)) ;
++void init_signals A((void)) ;
+ void add_crs A((char *from, char *to, int *sizep)) ;
+ void strip_crs A((char *from, char *to, int *sizep)) ;
+ void background A((void)) ;
++void initialize_siglist A((void)) ;
+ 
+-extern int errno ;
++//extern int errno ;
+ 
+ /* global variables */
+ extern int serverflag ;
+@@ -49,4 +56,4 @@ extern int quitflag ;
+ extern int crlfflag ;
+ extern int active_socket ;
+ extern char *progname ;
+-extern char *sys_errlist[], *sys_siglist[] ;
++extern char *socket_siglist[] ;
+--- socket-1.1.orig/io.c
++++ socket-1.1/io.c
+@@ -9,6 +9,11 @@ Please read the file COPYRIGHT for furth
+ 
+ #define _BSD			/* AIX *loves* this */
+ 
++#ifdef __linux__
++#include <unistd.h>
++#include <string.h>
++#endif
++#include <stdlib.h>
+ #include <sys/types.h>
+ #include <sys/time.h>
+ #ifdef ISC
+@@ -70,11 +75,13 @@ int size, to ;
+ 	} else {
+ 	    strip_crs(buffer, buffer2, &size) ;
+ 	}
+-    } else {
+-	bcopy(buffer, buffer2, size) ;
++    // debfix } else {
++	// debfix bcopy(buffer, buffer2, size) ;
++	buffer = buffer2 ;
+     }
+     while (size > 0) {
+-	written = write(to, buffer2, size) ;
++	// written = write(to, buffer2, size) ;
++	written = write(to, buffer, size) ;
+ 	if (written == -1) {
+ 	    /* this should not happen */
+ 	    perror2("write") ;
+@@ -84,13 +91,14 @@ int size, to ;
+ 	    return -1 ;
+ 	}
+ 	size -= written ;
++	buffer += written ;
+     }
+     return 1 ;
+ }
+ 
+ /* all IO to and from the socket is handled here. The main part is
+  * a loop around select(2). */
+-do_io()
++void do_io()
+ {
+     fd_set readfds ;
+     int fdset_width ;
+--- socket-1.1.orig/siglist.c
++++ socket-1.1/siglist.c
+@@ -23,6 +23,9 @@ Foundation, 675 Mass Ave, Cambridge, MA
+ 
+ #include <stdio.h>
+ #include <signal.h>
++#include <stdlib.h>
++#include <string.h>
++#include <memory.h>
+ 
+ #if !defined (NSIG)
+ #  if defined (_NSIG)
+@@ -32,37 +35,37 @@ Foundation, 675 Mass Ave, Cambridge, MA
+ #  endif /* !_NSIG */
+ #endif /* !NSIG */
+ 
+-char *sys_siglist[NSIG];
++char *socket_siglist[NSIG];
+ 
+-extern *malloc ();
++/* extern *malloc (); */	/* see stdlib.h and/or malloc.h, by apal@szofi */
+ 
+-initialize_siglist ()
++void initialize_siglist ()
+ {
+   register int i;
+ 
+   for (i = 0; i < NSIG; i++)
+-    sys_siglist[i] = (char *)0x0;
++    socket_siglist[i] = (char *)0x0;
+ 
+-  sys_siglist[0] = "Bogus signal";
++  socket_siglist[0] = "Bogus signal";
+ 
+ #if defined (SIGHUP)
+-  sys_siglist[SIGHUP] = "Hangup signal";
++  socket_siglist[SIGHUP] = "Hangup signal";
+ #endif
+ 
+ #if defined (SIGINT)
+-  sys_siglist[SIGINT] = "Interrupt";
++  socket_siglist[SIGINT] = "Interrupt";
+ #endif
+ 
+ #if defined (SIGQUIT)
+-  sys_siglist[SIGQUIT] = "Quit signal";
++  socket_siglist[SIGQUIT] = "Quit signal";
+ #endif
+ 
+ #if defined (SIGILL)
+-  sys_siglist[SIGILL] = "Illegal instruction";
++  socket_siglist[SIGILL] = "Illegal instruction";
+ #endif
+ 
+ #if defined (SIGTRAP)
+-  sys_siglist[SIGTRAP] = "BPT trace/trap";
++  socket_siglist[SIGTRAP] = "BPT trace/trap";
+ #endif
+ 
+ #if defined (SIGIOT) && !defined (SIGABRT)
+@@ -70,59 +73,59 @@ initialize_siglist ()
+ #endif
+ 
+ #if defined (SIGABRT)
+-  sys_siglist[SIGABRT] = "ABORT instruction";
++  socket_siglist[SIGABRT] = "ABORT instruction";
+ #endif
+ 
+ #if defined (SIGEMT)
+-  sys_siglist[SIGEMT] = "EMT instruction";
++  socket_siglist[SIGEMT] = "EMT instruction";
+ #endif
+ 
+ #if defined (SIGFPE)
+-  sys_siglist[SIGFPE] = "Floating point exception";
++  socket_siglist[SIGFPE] = "Floating point exception";
+ #endif
+ 
+ #if defined (SIGKILL)
+-  sys_siglist[SIGKILL] = "Kill signal";
++  socket_siglist[SIGKILL] = "Kill signal";
+ #endif
+ 
+ #if defined (SIGBUS)
+-  sys_siglist[SIGBUS] = "Bus error";
++  socket_siglist[SIGBUS] = "Bus error";
+ #endif
+ 
+ #if defined (SIGSEGV)
+-  sys_siglist[SIGSEGV] = "Segmentation fault";
++  socket_siglist[SIGSEGV] = "Segmentation fault";
+ #endif
+ 
+ #if defined (SIGSYS)
+-  sys_siglist[SIGSYS] = "Bad system call";
++  socket_siglist[SIGSYS] = "Bad system call";
+ #endif
+ 
+ #if defined (SIGPIPE)
+-  sys_siglist[SIGPIPE] = "Broken pipe condition";
++  socket_siglist[SIGPIPE] = "Broken pipe condition";
+ #endif
+ 
+ #if defined (SIGALRM)
+-  sys_siglist[SIGALRM] = "Alarm clock signal";
++  socket_siglist[SIGALRM] = "Alarm clock signal";
+ #endif
+ 
+ #if defined (SIGTERM)
+-  sys_siglist[SIGTERM] = "Termination signal";
++  socket_siglist[SIGTERM] = "Termination signal";
+ #endif
+ 
+ #if defined (SIGURG)
+-  sys_siglist[SIGURG] = "Urgent IO condition";
++  socket_siglist[SIGURG] = "Urgent IO condition";
+ #endif
+ 
+ #if defined (SIGSTOP)
+-  sys_siglist[SIGSTOP] = "Stop signal";
++  socket_siglist[SIGSTOP] = "Stop signal";
+ #endif
+ 
+ #if defined (SIGTSTP)
+-  sys_siglist[SIGTSTP] = "Stopped";
++  socket_siglist[SIGTSTP] = "Stopped";
+ #endif
+ 
+ #if defined (SIGCONT)
+-  sys_siglist[SIGCONT] = "Continue signal";
++  socket_siglist[SIGCONT] = "Continue signal";
+ #endif
+ 
+ #if !defined (SIGCHLD) && defined (SIGCLD)
+@@ -130,93 +133,93 @@ initialize_siglist ()
+ #endif
+ 
+ #if defined (SIGCHLD)
+-  sys_siglist[SIGCHLD] = "Child signal";
++  socket_siglist[SIGCHLD] = "Child signal";
+ #endif
+ 
+ #if defined (SIGTTIN)
+-  sys_siglist[SIGTTIN] = "Stop (tty input) signal";
++  socket_siglist[SIGTTIN] = "Stop (tty input) signal";
+ #endif
+ 
+ #if defined (SIGTTOU)
+-  sys_siglist[SIGTTOU] = "Stop (tty output) signal";
++  socket_siglist[SIGTTOU] = "Stop (tty output) signal";
+ #endif
+ 
+ #if defined (SIGIO)
+-  sys_siglist[SIGIO] = "I/O ready signal";
++  socket_siglist[SIGIO] = "I/O ready signal";
+ #endif
+ 
+ #if defined (SIGXCPU)
+-  sys_siglist[SIGXCPU] = "CPU limit exceeded";
++  socket_siglist[SIGXCPU] = "CPU limit exceeded";
+ #endif
+ 
+ #if defined (SIGXFSZ)
+-  sys_siglist[SIGXFSZ] = "File limit exceeded";
++  socket_siglist[SIGXFSZ] = "File limit exceeded";
+ #endif
+ 
+ #if defined (SIGVTALRM)
+-  sys_siglist[SIGVTALRM] = "Alarm (virtual)";
++  socket_siglist[SIGVTALRM] = "Alarm (virtual)";
+ #endif
+ 
+ #if defined (SIGPROF)
+-  sys_siglist[SIGPROF] = "Alarm (profile)";
++  socket_siglist[SIGPROF] = "Alarm (profile)";
+ #endif
+ 
+ #if defined (SIGWINCH)
+-  sys_siglist[SIGWINCH] = "Window change";
++  socket_siglist[SIGWINCH] = "Window change";
+ #endif
+ 
+ #if defined (SIGLOST)
+-  sys_siglist[SIGLOST] = "Record lock signal";
++  socket_siglist[SIGLOST] = "Record lock signal";
+ #endif
+ 
+ #if defined (SIGUSR1)
+-  sys_siglist[SIGUSR1] = "User signal 1";
++  socket_siglist[SIGUSR1] = "User signal 1";
+ #endif
+ 
+ #if defined (SIGUSR2)
+-  sys_siglist[SIGUSR2] = "User signal 2";
++  socket_siglist[SIGUSR2] = "User signal 2";
+ #endif
+ 
+ #if defined (SIGMSG)
+-  sys_siglist[SIGMSG] = "HFT input data pending signal";
++  socket_siglist[SIGMSG] = "HFT input data pending signal";
+ #endif 
+ 
+ #if defined (SIGPWR)
+-  sys_siglist[SIGPWR] = "power failure imminent signal";
++  socket_siglist[SIGPWR] = "power failure imminent signal";
+ #endif 
+ 
+ #if defined (SIGDANGER)
+-  sys_siglist[SIGDANGER] = "system crash imminent signal";
++  socket_siglist[SIGDANGER] = "system crash imminent signal";
+ #endif 
+ 
+ #if defined (SIGMIGRATE)
+-  sys_siglist[SIGMIGRATE] = "Process migration";
++  socket_siglist[SIGMIGRATE] = "Process migration";
+ #endif 
+ 
+ #if defined (SIGPRE)
+-  sys_siglist[SIGPRE] = "Programming error signal";
++  socket_siglist[SIGPRE] = "Programming error signal";
+ #endif 
+ 
+ #if defined (SIGGRANT)
+-  sys_siglist[SIGGRANT] = "HFT monitor mode granted signal";
++  socket_siglist[SIGGRANT] = "HFT monitor mode granted signal";
+ #endif 
+ 
+ #if defined (SIGRETRACT)
+-  sys_siglist[SIGRETRACT] = "HFT monitor mode retracted signal";
++  socket_siglist[SIGRETRACT] = "HFT monitor mode retracted signal";
+ #endif 
+ 
+ #if defined (SIGSOUND)
+-  sys_siglist[SIGSOUND] = "HFT sound sequence has completed signal";
++  socket_siglist[SIGSOUND] = "HFT sound sequence has completed signal";
+ #endif 
+ 
+   for (i = 0; i < NSIG; i++)
+     {
+-      if (!sys_siglist[i])
++      if (!socket_siglist[i])
+ 	{
+-	  sys_siglist[i] =
++	  socket_siglist[i] =
+ 	    (char *) malloc (10 + strlen ("Unknown Signal #"));
+ 
+-	  sprintf (sys_siglist[i], "Unknown Signal #%d", i);
++	  sprintf (socket_siglist[i], "Unknown Signal #%d", i);
+ 	}
+     }
+ }
+--- socket-1.1.orig/socket.1
++++ socket-1.1/socket.1
+@@ -7,7 +7,7 @@ Please read the file COPYRIGHT for furth
+ ..
+ .TH SOCKET 1 "Aug  6, 1992"
+ .SH NAME
+-socket \- create tcp socket and connect to stdin/out
++socket \- create a TCP or a UNIX domain socket and connect to stdin/out
+ .SH SYNOPSIS
+ .B socket
+ [
+@@ -17,6 +17,10 @@ socket \- create tcp socket and connect
+ .B \-p
+ .I command
+ ]
++[
++.B \-B
++.I local address
++]
+ .I host port
+ .br
+ .B socket
+@@ -27,14 +31,42 @@ socket \- create tcp socket and connect
+ .B \-p
+ .I command
+ ]
++.I /path
++.br
++.B socket
++[
++.B \-bcfqrvw
++]
++[
++.B \-p
++.I command
++]
++[
++.B \-B
++.I local address
++]
+ .B \-s 
+ [
+ .B \-l
+ ]
+ .I port
++.br
++.B socket
++[
++.B \-bcfqrvw
++]
++[
++.B \-p
++.I command
++]
++.B \-s 
++[
++.B \-l
++]
++.I /path
+ .SH DESCRIPTION
+ .B Socket
+-creates an Internet domain TCP socket and connects it to stdin and stdout.
++creates an Internet domain TCP or a UNIX domain stream socket and connects it to stdin and stdout.
+ The 
+ .I host
+ argument can be an Internet number in dot-notation (like
+@@ -46,6 +78,15 @@ The
+ argument can be a port number or a service name which can be mapped to
+ a port number by
+ .IR getservbyname (3).
++If an UNIX domain socket is wanted to be created instead of an Internet
++socket, specify the 
++.I path
++instead of an internet (canonical domain named or dot-notated) host.
++The hostname is treated as a pathname if contains at least a single 
++slash. I.e. if one wants to create or connect to a socket in the current 
++directory, use 
++.I ./filename
++to specify the connection point.
+ .SH OPTIONS
+ .TP
+ .BR "\-b " (background)
+@@ -53,6 +94,11 @@ The program forks itself into the backgr
+ controlling tty, closes the file descriptors associated with the tty,
+ and changes its current directory to the root directory.
+ .TP
++.BR "\-B " "(local address)"
++This option specifies which
++.I local address
++to binded to when making a connection.
++.TP
+ .BR "\-c " (crlf)
+ Linefeed characters (LF) are converted to a Carriage Return Linefeed
+ sequence (CRLF) when written to the socket.
+@@ -87,7 +133,8 @@ No data is read from standard input and
+ A server socket is created.
+ A
+ .I hostname 
+-argument is not required.
++argument is not required of Internet sockets, only the port number 
++but a pathname is required for UNIX domain sockets.
+ .TP
+ .BR "\-v " (verbose)
+ Messages about connections etc. are issued to stderr.
+@@ -143,8 +190,12 @@ A non-zero exit code is returned if
+ .B socket
+ terminates due to an error condition or a signal.
+ .SH SEE ALSO
++.BR ip (7),
++.BR tcp (7),
++.BR unix (7),
+ .BR accept (2),
+ .BR bind (2),
++.BR listen (2), 
+ .BR connect (2), 
+ .BR socket (2),
+ .BR gethostbyname (3),
+--- socket-1.1.orig/socket.c
++++ socket-1.1/socket.c
+@@ -7,9 +7,13 @@ Please read the file COPYRIGHT for furth
+ 
+ */
+ 
++#ifdef __linux__
++#include <unistd.h>
++#endif 
+ #include <sys/types.h>
+ #include <sys/socket.h>
+ #include <netinet/in.h>
++#include <sys/un.h>
+ #include <netdb.h>
+ #include <errno.h>
+ #include <stdio.h>
+@@ -19,6 +23,8 @@ Please read the file COPYRIGHT for furth
+ #include <string.h>
+ #endif
+ #include "globals.h"
++#include <stdint.h> // debfix
++#include <stdlib.h>
+ 
+ /* global variables */
+ int forkflag = 0 ;		/* server forks on connection */
+@@ -33,10 +39,12 @@ int backgflag = 0 ;		/* put yourself in
+ int active_socket ;		/* socket with connection */
+ char *progname ;		/* name of the game */
+ char *pipe_program = NULL ;	/* program to execute in two-way pipe */
++int WaitForever = 0;            /* wait forever for socket on connection refused */
++long int local_ip=0;           /* IP to bind at local */
+ 
+-void server A((int port, char *service_name)) ;
++void server A((long int local_ip,char *path, int port, char *service_name)) ;
+ void handle_server_connection A((void)) ;
+-void client A((char *host, int port, char *service_name)) ;
++void client A((long int local_ip,char *host, int port, char *service_name)) ;
+ 
+ int main(argc, argv)
+ int argc ;
+@@ -46,9 +54,10 @@ char **argv ;
+     int opt ;			/* option character */
+     int error = 0 ;		/* usage error occurred */
+     extern int optind ;		/* from getopt() */
+-    char *host ;		/* name of remote host */
++/*    char *host ;  */		/* name of remote host */
+     int port ;			/* port number for socket */
+     char *service_name ;	/* name of service for port */
++    char *path;			/* path to unix domain socket */
+ 
+     /* print version ID if requested */
+     if (argv[1] && !strcmp(argv[1], "-version")) {
+@@ -58,10 +67,10 @@ char **argv ;
+ 
+     /* set up progname for later use */
+     progname = argv[0] ;
+-    if (cp = strrchr(progname, '/')) progname = cp + 1 ;
++    if ((cp = strrchr(progname, '/'))) progname = cp + 1 ;
+ 
+     /* parse options */
+-    while ((opt = getopt(argc, argv, "bcflp:qrsvw?")) != -1) {
++    while ((opt = getopt(argc, argv, "B:bcflp:qrsvWw?")) != -1) {
+ 	switch (opt) {
+ 	  case 'f':
+ 	    forkflag = 1 ;
+@@ -69,6 +78,17 @@ char **argv ;
+ 	  case 'c':
+ 	    crlfflag = 1 ;
+ 	    break ;
++          case 'B': 
++            {
++              struct hostent *dataip;
++              char *cad;
++              cad=argv[optind-1];
++              dataip=gethostbyname(cad);
++              if (dataip!=NULL) {
++                local_ip=*((long int*)dataip->h_addr_list[0]);
++              }
++            }
++            break;
+ 	  case 'w':
+ 	    writeonlyflag = 1 ;
+ 	    break ;
+@@ -93,15 +113,27 @@ char **argv ;
+ 	  case 'b':
+ 	    backgflag = 1 ;
+ 	    break ;
++	  case 'W':
++	    WaitForever = 1 ;
+ 	  default:
+ 	    error++ ;
+ 	}
+     }
+-    if (error ||		/* usage error? */
+-	argc - optind + serverflag != 2) { /* number of args ok? */
+-	usage() ;
++    if ( error || optind >= argc )
++     {	usage();
++	exit(15);
++     }
++    if ( strchr(argv[optind],'/') != NULL )
++	path=argv[optind];
++    else
++	path=NULL;
++
++    /* number of args ok? */
++    if ( ( path == NULL && argc - optind + serverflag != 2 ) ||
++    ( path != NULL && argc - optind != 1 ) )
++     {	usage() ;
+ 	exit(15) ;
+-    }
++     }
+ 
+     /* check some option combinations */
+ #define senseless(s1, s2) \
+@@ -127,77 +159,100 @@ char **argv ;
+     init_signals() ;
+ 
+     /* get port number */
+-    port = resolve_service(argv[optind + 1 - serverflag],
++    if ( path==NULL )
++     {    port = resolve_service(argv[optind + 1 - serverflag],
+ 			   "tcp", &service_name) ;
+-    if (port < 0) {
+-	fprintf(stderr, "%s: unknown service\n", progname) ;
+-	exit(5) ;
+-    }
++	 if (port < 0) {
++		fprintf(stderr, "%s: unknown service\n", progname) ;
++		exit(5) ;
++	    }
++     }
++    else
++	port=-1;	/* no port for UNIX sockets */
+ 
+     /* and go */
+     if (serverflag) {
+ 	if (backgflag) {
+ 	    background() ;
+ 	}
+-	server(port, service_name) ;
+-    } else {
+-	client(argv[optind], port, service_name) ;
+-    }	       
++	server(local_ip,path,port,service_name) ;
++    } else if ( path != NULL )
++	client(local_ip,path, -1, service_name) ;
++    else
++    	client(local_ip,argv[optind], port, service_name) ;
+     exit(0) ;
+ }
+ 
+ 
+-void server(port, service_name)
++void server(local_ip,path,port, service_name)
++long int local_ip ;
++char *path;
+ int port ;
+ char *service_name ;
+ {
+     int socket_handle, alen ;
+ 
+     /* allocate server socket */
+-    socket_handle = create_server_socket(port, 1) ;
++    if ( path != NULL )
++	    socket_handle = create_server_socket_unix(path,1);
++    else
++	    socket_handle = create_server_socket_inet(local_ip,port, 1) ;
+     if (socket_handle < 0) {
+ 	perror2("server socket") ;
+ 	exit(1) ;
+     }
+     if (verboseflag) {
+-	fprintf(stderr, "listening on port %d", port) ;
+-	if (service_name) {
+-	    fprintf(stderr, " (%s)", service_name) ;
+-	}
+-	fprintf(stderr, "\n") ;
++	if ( path==NULL )
++	 {	fprintf(stderr, "inet: listening on port %d", port) ;
++		if (service_name) {
++		    fprintf(stderr, " (%s)", service_name) ;
++		}
++		fprintf(stderr, "\n") ;
++	 }
++	else
++		fprintf(stderr, "unix: bound to %s\n",path);
+     }
+ 
+     /* server loop */
+     do {
+-	struct sockaddr_in sa ;
++	union 
++	 {	struct sockaddr_in sa ;
++		struct sockaddr_un su ;
++	 } peer;
+ 	    
+-	alen = sizeof(sa) ;
++	alen = sizeof(peer) ;
+ 
+ 	/* accept a connection */
+ 	if ((active_socket = accept(socket_handle,
+-			  (struct sockaddr *) &sa,
++			  (struct sockaddr *) &peer,
+ 			  &alen)) == -1) {
+ 	    perror2("accept") ;
+ 	} else {
+ 	    /* if verbose, get name of peer and give message */
+-	    if (verboseflag) {
+-		struct hostent *he ;
+-		long norder ;
+-		char dotted[20] ;
+-
+-		he = gethostbyaddr(&sa.sin_addr.s_addr,
+-				   sizeof(sa.sin_addr.s_addr), AF_INET) ;
+-		if (!he) {
+-		    norder = htonl(sa.sin_addr.s_addr) ;
+-		    sprintf(dotted, "%d.%d.%d.%d",
+-			    (norder >> 24) & 0xff,
+-			    (norder >> 16) & 0xff,
+-			    (norder >>  8) & 0xff,
+-			    norder & 0xff) ;
+-		}
+-		fprintf(stderr, "connection from %s\n",
+-			(he ? he->h_name : dotted)) ;
+-	    }
++	    if (verboseflag)
++	     {
++		if ( peer.sa.sin_family==AF_INET )
++	 	 {	struct hostent *he ;
++			// debfix long norder ;
++			uint32_t norder;
++			char dotted[20] ;
++
++			he = gethostbyaddr((char *) &peer.sa.sin_addr.s_addr,
++				   sizeof(peer.sa.sin_addr.s_addr), AF_INET) ;
++			if (!he) {
++			    norder = htonl(peer.sa.sin_addr.s_addr) ;
++			    sprintf(dotted, "%ld.%ld.%ld.%ld",
++				    (norder >> 24) & 0xff,
++				    (norder >> 16) & 0xff,
++				    (norder >>  8) & 0xff,
++				    norder & 0xff) ;
++			}
++			fprintf(stderr, "inet: connection from %s\n",
++				(he ? he->h_name : dotted)) ;
++		 }
++		else if ( peer.su.sun_family==AF_UNIX )
++			fprintf(stderr,"unix: connection from %s\n",path);
++	     }
+ 	    if (forkflag) {
+ 		switch (fork()) {
+ 		  case 0:
+@@ -215,6 +270,11 @@ char *service_name ;
+ 	    }
+ 	}
+     } while (loopflag) ;
++
++   close(socket_handle);
++   if ( path != NULL )
++	unlink(path);
++	
+ }
+ 
+ 
+@@ -235,13 +295,26 @@ void handle_server_connection()
+ }
+ 
+ 
+-void client(host, port, service_name)
++void client(local_ip,host, port, service_name)
++long int local_ip;
+ char *host ;
+ int port ;
+ char *service_name ;
+ {
++    int	is_unix_socket;
++
+     /* get connection */
+-    active_socket = create_client_socket(&host, port) ;
++    if ( port>=0 )
++     {    while (1) {
++		active_socket = create_client_socket_inet(local_ip,&host, port) ;
++		if (active_socket >= 0 || !WaitForever || errno != ECONNREFUSED) 
++			break;
++		sleep( 60 );
++	    }
++     }
++    else
++	   active_socket = create_client_socket_unix(host);	
++
+     if (active_socket == -1) {
+ 	perror2("client socket") ;
+ 	exit(errno) ;
+@@ -250,11 +323,15 @@ char *service_name ;
+ 	exit(13) ;
+     }
+     if (verboseflag) {
+-	fprintf(stderr, "connected to %s port %d", host, port) ;
+-	if (service_name) {
+-	    fprintf(stderr, " (%s)", service_name) ;
+-	}
+-	fprintf(stderr, "\n") ;
++	if ( port>=0 )
++	 {	fprintf(stderr, "inet: connected to %s port %d", host, port) ;
++		if (service_name) {
++		    fprintf(stderr, " (%s)", service_name) ;
++		}
++		fprintf(stderr, "\n") ;
++	 }
++	else
++		fprintf(stderr, "unix: connected to %s\n", host);
+     }
+ 
+     /* open pipes to program if requested */
+--- socket-1.1.orig/socketp.c
++++ socket-1.1/socketp.c
+@@ -7,18 +7,32 @@ Please read the file COPYRIGHT for furth
+ 
+ */
+ 
++#ifdef __linux__
++#include <string.h>
++#include <stdlib.h>
++#include <unistd.h>
++#include <arpa/inet.h>
++#endif
+ #include <sys/types.h>
+ #include <sys/socket.h>
+ #include <sys/errno.h>
++#include <sys/un.h>
++#include <sys/stat.h>
+ #include <netinet/in.h>
+ #include <netdb.h>
+ #include <stdio.h>
+ #include "globals.h"
++#include <stdint.h> // debfix
++
++#ifndef	UNIX_PATH_MAX
++#define UNIX_PATH_MAX    108
++#endif
+ 
+ /*
+- * create a server socket on PORT accepting QUEUE_LENGTH connections
++ * create an INET server socket on PORT accepting QUEUE_LENGTH connections
+  */
+-int create_server_socket(port, queue_length)
++int create_server_socket_inet(local_ip, port, queue_length)
++long int local_ip ;
+ int port ;
+ int queue_length ;
+ {
+@@ -31,13 +45,49 @@ int queue_length ;
+ 
+     bzero((char *) &sa, sizeof(sa)) ;
+     sa.sin_family = AF_INET ;
+-    sa.sin_addr.s_addr = htonl(INADDR_ANY) ;
++    if (local_ip)
++      sa.sin_addr.s_addr = local_ip;
++    else 
++      sa.sin_addr.s_addr = htonl(INADDR_ANY) ;
+     sa.sin_port = htons(port) ;
+ 
+     if (bind(s, (struct sockaddr *) &sa, sizeof(sa)) < 0) {
+ 	return -1 ;
+     }
+-    if (listen(s, 1) < 0) {
++    if (listen(s, queue_length) < 0) {
++	return -1 ;
++    }
++
++    return s ;
++}
++
++/*
++ * create a UNIX server socket bound to PATH accepting QUEUE_LENGTH connections
++ */
++int create_server_socket_unix(pathname, queue_length)
++char *pathname;
++int queue_length ;
++{
++    struct sockaddr_un su ;
++    int s;
++    struct stat st;
++
++    if ((s = socket(PF_UNIX, SOCK_STREAM, 0)) < 0) {
++	return -1 ;
++    }
++
++    bzero((char *) &su, sizeof(su)) ;
++    su.sun_family = AF_UNIX ;
++    strncpy(su.sun_path,pathname,UNIX_PATH_MAX);
++    su.sun_path[UNIX_PATH_MAX-1]=0;
++
++    if ( ! stat(su.sun_path,&st) && S_ISSOCK(st.st_mode) )
++	unlink(su.sun_path);
++
++    if (bind(s, (struct sockaddr *) &su, sizeof(su)) < 0) {
++	return -1 ;
++    }
++    if (listen(s, queue_length) < 0) {
+ 	return -1 ;
+     }
+ 
+@@ -46,14 +96,16 @@ int queue_length ;
+ 
+ 
+ /* create a client socket connected to PORT on HOSTNAME */
+-int create_client_socket(hostname, port)
++int create_client_socket_inet(local_ip,hostname, port)
++long int local_ip ;
+ char **hostname ;
+ int port ;
+ {
+     struct sockaddr_in sa ;
+     struct hostent *hp ;
+-    int a, s ;
+-    long addr ;
++    int s ;
++    // debfix long addr ;
++    uint32_t addr ;
+ 
+ 
+     bzero(&sa, sizeof(sa)) ;
+@@ -76,13 +128,42 @@ int port ;
+     if ((s = socket(sa.sin_family, SOCK_STREAM, 0)) < 0) { /* get socket */
+ 	return -1 ;
+     }
+-    if (connect(s, &sa, sizeof(sa)) < 0) {                  /* connect */
++    if (local_ip) {
++      struct sockaddr_in direc; 
++      bzero(&direc,sizeof(direc));
++      direc.sin_addr.s_addr=local_ip;
++      direc.sin_family=AF_INET;
++      bind(s,(struct sockaddr *)&direc,sizeof(direc)); 
++    }
++    if (connect(s, (struct sockaddr *) &sa, sizeof(sa)) < 0) {                  /* connect */
++	close(s) ;
++	return -1 ;
++    }
++    return s ;
++}
++
++/* create a client socket connected to UNIX domain socket "pathname" */
++int create_client_socket_unix(pathname)
++char *pathname ;
++{
++    struct sockaddr_un su ;
++    int s ;
++
++    su.sun_family=AF_UNIX;
++    strncpy(su.sun_path,pathname,UNIX_PATH_MAX);
++    su.sun_path[UNIX_PATH_MAX-1]=0;
++
++    if ((s = socket(PF_UNIX, SOCK_STREAM, 0)) < 0) { /* get socket */
++	return -1 ;
++    }
++    if (connect(s, (struct sockaddr *) &su, sizeof(su)) < 0) {                  /* connect */
+ 	close(s) ;
+ 	return -1 ;
+     }
+     return s ;
+ }
+ 
++
+ /* return the port number for service NAME_OR_NUMBER. If NAME is non-null,
+  * the name is the service is written there.
+  */
+--- socket-1.1.orig/utils.c
++++ socket-1.1/utils.c
+@@ -15,6 +15,10 @@ Please read the file COPYRIGHT for furth
+ #endif
+ 
+ #include <stdio.h>
++#ifdef __linux__
++#include <unistd.h>
++#endif
++#include <stdlib.h>
+ #include <signal.h>
+ #include <sys/wait.h>
+ #include <sys/time.h>
+@@ -33,7 +37,7 @@ SIG_HANDLER_RET exitsig(sig)
+ int sig ;
+ {
+     if (sig != SIGUSR1) {
+-	fprintf(stderr, "\n%s occured, exiting\n", sys_siglist[sig]) ;
++	fprintf(stderr, "\n%s occured, exiting\n", socket_siglist[sig]) ;
+     }
+     exit(-sig) ;
+ }
+@@ -42,7 +46,7 @@ int sig ;
+ void usage()
+ {
+     static char ustring[] =
+-	"Usage: %s [-bclqrvw] [-p prog] [-s | host] port\n" ;
++	"Usage: %s [-bclqrvw] [-B local ip] [-p prog] {{-s|host} port | [-s] /path}\n" ;
+ 
+     fprintf(stderr, ustring, progname) ;
+ }
+@@ -70,10 +74,10 @@ char *s ;
+ 
+ /* set up signal handling. All except TSTP, CONT, CLD, and QUIT
+  * are caught with exitsig(). */
+-init_signals()
++void init_signals()
+ {
+     int i ;
+-#ifdef SIG_SETMASK		/* only with BSD signals */
++#ifdef BSD_SIG_SETMASK		/* only with BSD signals */
+     static struct sigvec svec = { exitsig, ~0, 0 } ;
+ #endif
+ 
+@@ -103,7 +107,7 @@ init_signals()
+ 	  case SIGQUIT:		/* if the user wants a core dump, */
+ 	    continue ;		/* they can have it. */
+ 	  default:	    
+-#ifdef SIG_SETMASK
++#ifdef BSD_SIG_SETMASK
+ 	    sigvec(i, &svec, NULL) ;
+ #else
+ 	    signal(i, exitsig) ;
